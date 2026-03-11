@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>다면평가 초고속 개인별 Report 뷰어</title>
+
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    
+    <style>
+        body {
+            overscroll-behavior-y: none;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            background-color: #f8fafc;
+            font-family: 'Malgun Gothic', '맑은 고딕', 'Apple SD Gothic Neo', sans-serif;
+        }
+        .scrollable { user-select: text; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* 섹션 페이지 분할 방지 힌트 (웹 및 인쇄 공통) */
+        .pdf-section-block {
+            page-break-inside: avoid;
+            break-inside: avoid;
+        }
+
+        /* =========================================
+           [핵심 추가] 네이티브 인쇄(PDF) 전용 스타일
+           ========================================= */
+        @media print {
+            @page {
+                size: A4 portrait;
+                margin: 10mm; 
+            }
+            body, html, #root, #app-body {
+                background-color: white !important;
+                height: auto !important;
+                overflow: visible !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+            }
+            /* 인쇄 시 불필요한 UI 숨김 */
+            .no-print { display: none !important; }
+            
+            /* 메인 영역 확장 */
+            .print-expand {
+                width: 100% !important;
+                height: auto !important;
+                overflow: visible !important;
+                background-color: white !important;
+            }
+            
+            /* 카드 넘김 처리 및 여백 정리 */
+            .print-card-container {
+                page-break-after: always;
+                break-after: page;
+                box-shadow: none !important;
+                border: none !important;
+                padding: 0 !important;
+                margin-bottom: 0 !important;
+            }
+            .print-card-container:last-child {
+                page-break-after: auto;
+                break-after: auto;
+            }
+            
+            /* 인쇄용 차트 글꼴 강제 고정 */
+            text {
+                font-family: 'Malgun Gothic', '맑은 고딕', sans-serif !important;
+            }
+
+            /* 제목 고립 방지 및 통짜 유지 */
+            .print-section-avoid {
+                page-break-inside: avoid !important;
+                break-inside: avoid !important;
+            }
+            .print-heading-avoid {
+                page-break-after: avoid !important;
+                break-after: avoid !important;
+                page-break-inside: avoid !important;
+                break-inside: avoid !important;
+            }
+        }
+    </style>
+</head>
+<body id="app-body" class="h-screen w-screen overflow-hidden flex flex-col text-slate-800">
+<div id="root" class="h-full w-full flex"></div>
+<script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    const nbsp = (str) => String(str).replace(/ /g, '\u00A0');
+
+    // =====================================================================
+    // [Logic] 데이터 파싱 (스마트 파싱 유지)
+    // =====================================================================
+    const parseExcelData = (workbook) => {
+        const sheetsData = {};
+        let availableYears = [];
+        workbook.SheetNames.forEach(sheetName => {
+            const rawData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: "" });
+            if (!rawData.length) return;
+
+            const yearMatch = sheetName.match(/\d{4}/);
+            const year = yearMatch ? yearMatch[0] : String(rawData[0]['연도'] || '').trim();
+            if (!year || !/^\d{4}$/.test(year)) return;
+
+            if (!availableYears.includes(year)) availableYears.push(year);
+
+            const cleanedData = rawData.map(row => {
+                const cleanRow = {};
+                Object.keys(row).forEach(key => {
+                    const cleanKey = key.replace(/\uFEFF/g, '').trim();
+                    const val = row[key];
+                    cleanRow[cleanKey] = typeof val === 'string' ? val.replace(/\uFEFF/g, '').trim() : val;
+                });
+                return cleanRow;
+            }).filter(row => row['그룹'] && row['이름'] && String(row['이름']) !== 'nan');
+
+            if (sheetsData[year]) {
+                sheetsData[year] = sheetsData[year].concat(cleanedData);
+            } else {
+                sheetsData[year] = cleanedData;
+            }
+        });
+
+        const groupSet = new Set();
+        Object.values(sheetsData).forEach(rows => rows.forEach(r => { if (r['그룹']) groupSet.add(String(r['그룹'])); }));
+        const availableGroups = [...groupSet];
+
+        return { sheetsData, availableYears: availableYears.sort().reverse(), availableGroups };
+    };
+
+    const calculatePersonScore = (rowData) => {
+        const safeFloat = (val) => {
+            if (val === null || val === undefined || String(val).trim() === '') return null;
+            const num = parseFloat(val);
+            return isNaN(num) ? null : num;
+        };
+        const data = {
+            total_score: safeFloat(rowData['종합점수']) || 0,
+            has_superior: false,
+            raw_scores: { peer: null, subordinate: null, superior: null },
+            area_scores: [],
+            top_strong: [],
+            top_weak: [],
+            feedbacks: []
+        };
+        if (rowData['동료평균'] !== undefined && rowData['동료평균'] !== '') data.raw_scores.peer = safeFloat(rowData['동료평균']);
+        if (rowData['부하평균'] !== undefined && rowData['부하평균'] !== '') data.raw_scores.subordinate = safeFloat(rowData['부하평균']);
+        if (rowData['상사평균'] !== undefined && rowData['상사평균'] !== '') {
+            data.raw_scores.superior = safeFloat(rowData['상사평균']);
+            data.has_superior = true;
+        }
+        const keys = Object.keys(rowData);
+        const areaNames = keys.filter(k => String(k).endsWith('_합산')).map(k => String(k).replace('_합산', ''));
+        const processedCols = new Set(['종합점수', '동료평균', '부하평균', '상사평균', '이름', '그룹', '연도', '종합순위', '동료순위', '부하순위', '상사순위', 'Unnamed: 0']);
+        areaNames.forEach(area => {
+            processedCols.add(`${area}_합산`); processedCols.add(`${area}_동료`);
+            processedCols.add(`${area}_부하`); processedCols.add(`${area}_상사`);
+            data.area_scores.push({
+                영역: area,
+                합산: safeFloat(rowData[`${area}_합산`]),
+                동료: safeFloat(rowData[`${area}_동료`]),
+                부하: safeFloat(rowData[`${area}_부하`]),
+                상사: safeFloat(rowData[`${area}_상사`])
+            });
+        });
+        for (let i = 1; i <= 2; i++) {
+            ['강점', '약점'].forEach(prefix => {
+                processedCols.add(`${prefix}${i}_영역`); processedCols.add(`${prefix}${i}_항목`); processedCols.add(`${prefix}${i}_점수`);
+            });
+            if (rowData[`강점${i}_영역`]) data.top_strong.push({ 영역: String(rowData[`강점${i}_영역`]).trim(), 평가항목: String(rowData[`강점${i}_항목`]).trim(), 합산: safeFloat(rowData[`강점${i}_점수`]) });
+            if (rowData[`약점${i}_영역`]) data.top_weak.push({ 영역: String(rowData[`약점${i}_영역`]).trim(), 평가항목: String(rowData[`약점${i}_항목`]).trim(), 합산: safeFloat(rowData[`약점${i}_점수`]) });
+        }
+        keys.forEach(col_name => {
+            const col_str = String(col_name).trim();
+            if (processedCols.has(col_str)) return;
+            const val = rowData[col_name];
+            if (val === null || val === undefined || String(val).trim() === '') return;
+            const val_str = String(val).trim();
+            let isFeedback = false; let fbType = '동료';
+            if (col_str.includes('동료')) { isFeedback = true; fbType = '동료'; }
+            else if (col_str.includes('부하') || col_str.includes('팀원')) { isFeedback = true; fbType = '부하'; }
+            else if (col_str.includes('상사') || col_str.includes('팀장') || col_str.includes('리더')) { isFeedback = true; fbType = '상사'; }
+            else if (['의견', '서술', '코멘트', '피드백', '정성'].some(k => col_str.includes(k))) isFeedback = true;
+            if (val_str.includes('--')) isFeedback = true;
+            if (isFeedback) {
+                val_str.split('--').map(c => c.trim()).filter(c => c !== '').forEach(comment => {
+                    const cleaned = comment.replace(/[.\s]/g, '');
+                    if (comment.length > 2 && (cleaned.length === 0 || isNaN(cleaned))) {
+                        data.feedbacks.push({ type: fbType, content: comment });
+                    }
+                });
+            }
+        });
+        return data;
+    };
+
+
+    // =====================================================================
+    // [Component] 레이더 차트
+    // =====================================================================
+    const RadarChart = ({ data, dataKey, color }) => {
+        if (!data || data.length === 0) return <div className="text-slate-400 font-bold flex items-center justify-center h-full">데이터 없음</div>;
+        const canvasSize = 500;
+        const center = canvasSize / 2;
+        const radius = 190; 
+        const maxValue = 6.0;
+        const angleStep = (Math.PI * 2) / data.length;
+
+        const getPoint = (value, index) => {
+            const angle = index * angleStep - Math.PI / 2;
+            const r = ((value || 0) / maxValue) * radius;
+            return `${center + r * Math.cos(angle)},${center + r * Math.sin(angle)}`;
+        };
+        const dataPoints = data.map((d, i) => getPoint(d[dataKey] || 0, i)).join(' ');
+
+        const getWrappedLines = (text) => {
+            if (!text) return [""];
+            if (text.length > 6 && text.includes(' ')) {
+                const words = text.split(' ');
+                const half = Math.ceil(words.length / 2);
+                return [words.slice(0, half).join('\u00A0'), words.slice(half).join('\u00A0')].filter(Boolean);
+            }
+            return [text.replace(/ /g, '\u00A0')];
+        };
+
+        return (
+            <div className="flex justify-center items-center w-full h-full p-2" style={{ overflow: 'visible' }}>
+                <svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"
+                     viewBox="-100 -60 700 620"
+                     style={{ overflow: 'visible', display: 'block' }}>
+                    {[1, 2, 3, 4, 5, 6].map(level => {
+                        const r = (level / maxValue) * radius;
+                        const points = data.map((_, i) => {
+                            const angle = i * angleStep - Math.PI / 2;
+                            return `${center + r * Math.cos(angle)},${center + r * Math.sin(angle)}`;
+                        }).join(' ');
+                        return <polygon key={level} points={points} fill={level % 2 === 0 ? "#f8fafc" : "#ffffff"} stroke="#e2e8f0" strokeWidth="1.5" />;
+                    })}
+                    {data.map((_, i) => {
+                        const angle = i * angleStep - Math.PI / 2;
+                        return <line key={`ax-${i}`} x1={center} y1={center} x2={center + radius * Math.cos(angle)} y2={center + radius * Math.sin(angle)} stroke="#cbd5e1" strokeWidth="1" strokeDasharray="4 3" className="print:hidden" />;
+                    })}
+                    <polygon points={dataPoints} fill={color} fillOpacity="0.22" stroke={color} strokeWidth="3" strokeLinejoin="round" />
+                    {data.map((d, i) => {
+                        const angle = i * angleStep - Math.PI / 2;
+                        const r = ((d[dataKey] || 0) / maxValue) * radius;
+                        return <circle key={`dot-${i}`} cx={center + r * Math.cos(angle)} cy={center + r * Math.sin(angle)} r="5" fill="#ffffff" stroke={color} strokeWidth="2.5" />;
+                    })}
+                    {data.map((d, i) => {
+                        const angle = i * angleStep - Math.PI / 2;
+                        const textR = radius + 45;
+                        const x = center + textR * Math.cos(angle);
+                        const y = center + textR * Math.sin(angle);
+                        let textAnchor = "middle";
+                        if (Math.cos(angle) > 0.15) textAnchor = "start";
+                        else if (Math.cos(angle) < -0.15) textAnchor = "end";
+                        const lines = getWrappedLines(d.영역);
+                        const yOffset = lines.length > 1 ? -8 : 5;
+                        return (
+                            <g key={`lbl-${i}`}>
+                                {lines.map((line, idx) => (
+                                    <text key={idx} x={x} y={y + yOffset + idx * 18}
+                                          textAnchor={textAnchor} fill="#334155" fontSize="14" fontWeight="700"
+                                          style={{ fontFamily: "'Malgun Gothic', '맑은 고딕', sans-serif" }}>
+                                        {line}
+                                    </text>
+                                ))}
+                            </g>
+                        );
+                    })}
+                </svg>
+            </div>
+        );
+    };
+
+    // =====================================================================
+    // [Component] 리포트 카드
+    // =====================================================================
+    const ReportCard = ({ year, personName, data, rankInfo, isEvaluateeMode = false }) => {
+        let rankText = "-", totalCount = "-";
+        if (rankInfo) {
+            rankText = rankInfo.rank !== '-' ? `${rankInfo.rank}위` : '-';
+            totalCount = rankInfo.total !== '-' ? `전체 ${rankInfo.total}명 중` : '-';
+        }
+
+        const renderSection = (title, dataKey, color, avgVal) => {
+            if (!data.area_scores || data.area_scores.length === 0) return null;
+            const validData = data.area_scores.filter(d => d[dataKey] !== null);
+            if (validData.length === 0) return null;
+            const maxV = Math.max(...validData.map(d => d[dataKey] || 0));
+            const minV = Math.min(...validData.map(d => d[dataKey] || 0));
+
+            return (
+                <div className="pdf-section-block mb-8 print:mb-6">
+                    <div className="bg-white border border-slate-200 flex flex-row items-stretch rounded-3xl p-6 gap-6 shadow-sm print:border-slate-300 print:shadow-none print:p-5" style={{ overflow: 'visible' }}>
+                        <div className="flex flex-col w-[60%] min-w-0" style={{ overflow: 'visible' }}>
+                            <h3 className="font-bold text-slate-800 flex items-center text-[18px] mb-3 print:text-[16px]">
+                                <span className="w-3 h-3 rounded-full mr-2.5 shrink-0" style={{ backgroundColor: color }}></span>
+                                <span>{nbsp(title)}</span>
+                            </h3>
+                            <div className="flex-1 min-h-[360px]" style={{ overflow: 'visible' }}>
+                                <RadarChart data={validData} dataKey={dataKey} color={color} />
+                            </div>
+                        </div>
+
+                        <div className="flex flex-col justify-center w-[40%] min-w-0">
+                            <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm print:border-slate-300 print:shadow-none">
+                                <table className="w-full text-center text-[14px] print:text-[13px]" style={{ borderCollapse: 'collapse' }}>
+                                    <thead>
+                                        <tr style={{ backgroundColor: color }}>
+                                            <th className="py-3 px-3 font-bold text-white w-[68%] print:py-2" style={{ verticalAlign: 'middle' }}>영역</th>
+                                            <th className="py-3 px-3 font-bold text-white border-l border-white/20 w-[32%] print:py-2" style={{ verticalAlign: 'middle' }}>점수</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {validData.map((d, i) => {
+                                            const val = d[dataKey] || 0;
+                                            const isMax = val === maxV && maxV !== minV;
+                                            const isMin = val === minV && maxV !== minV;
+                                            const rowBg = isMax ? '#eff6ff' : isMin ? '#fff1f2' : '#ffffff';
+                                            const textCls = isMax ? 'text-blue-700 font-bold' : isMin ? 'text-red-700 font-bold' : 'text-slate-700 font-medium';
+                                            const numCls = isMax ? 'text-blue-700 font-black' : isMin ? 'text-red-700 font-black' : 'text-slate-800 font-bold';
+                                            return (
+                                                <tr key={i} style={{ backgroundColor: rowBg, borderTop: i > 0 ? '1px solid #e2e8f0' : 'none' }}>
+                                                    <td className={`py-3 px-4 break-keep ${textCls} print:py-2 print:px-2`} style={{ verticalAlign: 'middle' }}>{d.영역}</td>
+                                                    <td className={`py-3 px-4 ${numCls} print:py-2 print:px-2`} style={{ verticalAlign: 'middle', borderLeft: '1px solid #e2e8f0' }}>{val.toFixed(2)}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                        {avgVal !== null && (
+                                            <tr style={{ backgroundColor: '#f1f5f9', borderTop: '2px solid #cbd5e1' }}>
+                                                <td className="py-3 px-4 font-bold text-slate-800 print:py-2 print:px-2" style={{ verticalAlign: 'middle' }}>전체 평균</td>
+                                                <td className="py-3 px-4 text-[16px] font-black print:text-[14px] print:py-2 print:px-2" style={{ verticalAlign: 'middle', borderLeft: '1px solid #cbd5e1', color: color }}>{avgVal.toFixed(2)}</td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const fbMap = { '동료': [], '부하': [], '상사': [] };
+        const allFeedbacks = [];
+        data.feedbacks.forEach(f => { 
+            if (fbMap[f.type]) fbMap[f.type].push(f.content); 
+            allFeedbacks.push(f.content);
+        });
+
+        const shuffledFeedbacks = useMemo(() => {
+            return [...allFeedbacks].sort(() => Math.random() - 0.5);
+        }, [data.feedbacks]);
+
+        return (
+            <div className="print-card-container bg-white border border-slate-200 rounded-[2rem] p-10 mb-12 shadow-lg">
+                <div className="pdf-section-block mb-10 print:mb-6">
+                    <div className="bg-gradient-to-r from-blue-50 to-white border border-blue-100 rounded-3xl p-8 flex flex-row items-center gap-8 shadow-sm print:border-slate-300 print:shadow-none print:p-5 print:gap-4">
+                        <div className="flex-1 min-w-0">
+                            <h2 className="text-[26px] font-black text-slate-800 leading-snug whitespace-nowrap print:text-[20px] print:whitespace-normal print:break-keep">
+                                {year}년 다면평가 결과&nbsp;<span className="text-blue-600">({personName})</span>
+                            </h2>
+                        </div>
+                        <div className="flex space-x-4 shrink-0 print:space-x-3">
+                            <div className="bg-white border border-slate-200 text-center flex flex-col justify-center items-center rounded-2xl px-7 py-5 min-w-[140px] shadow-sm print:border-slate-300 print:shadow-none print:px-4 print:py-3 print:min-w-0 print:w-[110px]">
+                                <p className="text-sm font-bold text-slate-500 mb-1 print:text-[11px]">{nbsp('종합 점수')}</p>
+                                <p className="text-[32px] font-black text-blue-600 leading-none print:text-[22px]">
+                                    {data.total_score !== null ? data.total_score.toFixed(2) : '-'}
+                                    <span className="text-base text-slate-400 ml-1 font-medium print:text-[12px]">/ 6.0</span>
+                                </p>
+                            </div>
+                            <div className="bg-white border border-slate-200 text-center flex flex-col justify-center items-center rounded-2xl px-7 py-5 min-w-[140px] shadow-sm print:border-slate-300 print:shadow-none print:px-4 print:py-3 print:min-w-0 print:w-[110px]">
+                                <p className="text-sm font-bold text-slate-500 mb-1 print:text-[11px]">{totalCount}</p>
+                                <p className="text-[32px] font-black text-blue-800 leading-none print:text-[22px]">{rankText}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {renderSection("종합 진단", "합산", "#2563eb", data.total_score)}
+                {!isEvaluateeMode && data.raw_scores.peer !== null && renderSection("동료 진단", "동료", "#16a34a", data.raw_scores.peer)}
+                {!isEvaluateeMode && data.raw_scores.subordinate !== null && renderSection("부하 진단", "부하", "#ea580c", data.raw_scores.subordinate)}
+                {!isEvaluateeMode && data.has_superior && data.raw_scores.superior !== null && renderSection("상사 진단", "상사", "#dc2626", data.raw_scores.superior)}
+
+                {(data.top_strong.length > 0 || data.top_weak.length > 0) && (
+                    <div className="mt-10 print:mt-6">
+                        <h3 className="pdf-section-block print-heading-avoid text-[20px] font-black text-slate-800 mb-5 print:mb-3 print:text-[18px]">
+                            {nbsp('📊 강점 및 약점 분석 (Top/Bottom 2)')}
+                        </h3>
+                        <div className="space-y-3">
+                            {data.top_strong.map((item, i) => (
+                                <div key={`s-${i}`} className="pdf-section-block flex items-center bg-blue-50/60 border border-blue-200 rounded-2xl p-5 shadow-sm print:border-slate-300 print:shadow-none print:bg-white print:p-4">
+                                    <div className="flex flex-col items-center justify-center shrink-0 rounded-xl mr-5 min-w-[66px] py-3.5 px-4 shadow-sm print:min-w-[56px] print:py-2 print:px-3 print:mr-4"
+                                         style={{ background: 'linear-gradient(160deg, #3b82f6, #1d4ed8)' }}>
+                                        <span className="text-[10px] font-bold text-blue-100 tracking-widest print:text-[9px]">강점</span>
+                                        <span className="text-[26px] font-black text-white leading-tight print:text-[22px]">{i + 1}</span>
+                                    </div>
+                                    <div className="text-[22px] w-16 font-black text-blue-600 text-center shrink-0 print:text-[18px] print:w-14">
+                                        {item.합산 !== null ? item.합산.toFixed(2) : '-'}
+                                    </div>
+                                    <div className="flex-1 border-l-2 border-blue-200 ml-4 pl-5 print:ml-3 print:pl-4">
+                                        <p className="text-[12px] text-blue-500 font-bold mb-1 print:text-[11px]">{item.영역}</p>
+                                        <p className="text-[16px] font-bold text-slate-800 break-keep print:text-[14px]">{item.평가항목}</p>
+                                    </div>
+                                </div>
+                            ))}
+                            {data.top_weak.map((item, i) => (
+                                <div key={`w-${i}`} className="pdf-section-block flex items-center bg-red-50/60 border border-red-200 rounded-2xl p-5 shadow-sm print:border-slate-300 print:shadow-none print:bg-white print:p-4">
+                                    <div className="flex flex-col items-center justify-center shrink-0 rounded-xl mr-5 min-w-[66px] py-3.5 px-4 shadow-sm print:min-w-[56px] print:py-2 print:px-3 print:mr-4"
+                                         style={{ background: 'linear-gradient(160deg, #ef4444, #b91c1c)' }}>
+                                        <span className="text-[10px] font-bold text-red-100 tracking-widest print:text-[9px]">약점</span>
+                                        <span className="text-[26px] font-black text-white leading-tight print:text-[22px]">{i + 1}</span>
+                                    </div>
+                                    <div className="text-[22px] w-16 font-black text-red-600 text-center shrink-0 print:text-[18px] print:w-14">
+                                        {item.합산 !== null ? item.합산.toFixed(2) : '-'}
+                                    </div>
+                                    <div className="flex-1 border-l-2 border-red-200 ml-4 pl-5 print:ml-3 print:pl-4">
+                                        <p className="text-[12px] text-red-500 font-bold mb-1 print:text-[11px]">{item.영역}</p>
+                                        <p className="text-[16px] font-bold text-slate-800 break-keep print:text-[14px]">{item.평가항목}</p>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {data.feedbacks.length > 0 && (
+                    <div className="mt-10 print:mt-6">
+                        <h3 className="pdf-section-block print-heading-avoid text-[20px] font-black text-slate-800 mb-5 print:mb-3 print:text-[18px]">
+                            {nbsp('💬 구성원 정성 의견 (Feedback)')}
+                        </h3>
+                        
+                        {isEvaluateeMode ? (
+                            <div className="bg-white rounded-2xl overflow-hidden shadow-sm print:border-slate-300 print:shadow-none" style={{ border: `1px solid #cbd5e1` }}>
+                                <div className="pdf-section-block px-6 py-4 text-[16px] font-bold flex items-center print:px-5 print:py-3 print:text-[15px]"
+                                     style={{ backgroundColor: '#f1f5f9', borderBottom: `1px solid #cbd5e1`, color: '#334155' }}>
+                                    <span className="mr-2.5 text-[18px]" style={{ color: '#64748b' }}>■</span>
+                                    {nbsp(`[구성원 종합 피드백]`)}
+                                </div>
+                                <div className="p-6 space-y-3 print:p-5 print:space-y-2">
+                                    {shuffledFeedbacks.map((content, idx) => (
+                                        <div key={idx} className="pdf-section-block flex items-start text-[15px] font-medium text-slate-700 break-keep print:text-[14px]">
+                                            <span className="mr-2.5 text-slate-300 shrink-0 mt-0.5 font-bold text-[18px] print:text-[16px] print:mt-0">•</span>
+                                            <p>{content}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="space-y-5 print:space-y-4">
+                                {Object.keys(fbMap).map(type => {
+                                    if (fbMap[type].length === 0) return null;
+                                    const cfg = {
+                                        '동료': { headerBg: '#eff6ff', headerBorder: '#bfdbfe', headerText: '#1e40af', border: '#bfdbfe', icon: '#3b82f6' },
+                                        '부하': { headerBg: '#fff7ed', headerBorder: '#fed7aa', headerText: '#9a3412', border: '#fed7aa', icon: '#f97316' },
+                                        '상사': { headerBg: '#fff1f2', headerBorder: '#fecdd3', headerText: '#9f1239', border: '#fecdd3', icon: '#ef4444' }
+                                    }[type];
+                                    return (
+                                        <div key={type} className="bg-white rounded-2xl overflow-hidden shadow-sm print:border-slate-300 print:shadow-none" style={{ border: `1px solid ${cfg.border}` }}>
+                                            <div className="pdf-section-block px-6 py-4 text-[16px] font-bold flex items-center print:px-5 print:py-3 print:text-[15px]"
+                                                 style={{ backgroundColor: cfg.headerBg, borderBottom: `1px solid ${cfg.headerBorder}`, color: cfg.headerText }}>
+                                                <span className="mr-2.5 text-[18px]" style={{ color: cfg.icon }}>■</span>
+                                                {nbsp(`[${type} 의견]`)}
+                                            </div>
+                                            <div className="p-6 space-y-3 print:p-5 print:space-y-2">
+                                                {fbMap[type].map((content, idx) => (
+                                                    <div key={idx} className="pdf-section-block flex items-start text-[15px] font-medium text-slate-700 break-keep print:text-[14px]">
+                                                        <span className="mr-2.5 text-slate-300 shrink-0 mt-0.5 font-bold text-[18px] print:text-[16px] print:mt-0">•</span>
+                                                        <p>{content}</p>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    // =====================================================================
+    // [Main App] UI 상호작용(UX) 개선 및 팝업 통합
+    // =====================================================================
+    const App = () => {
+        const [db, setDb] = useState(null);
+        const [currentYear, setCurrentYear] = useState("");
+        const [currentGroup, setCurrentGroup] = useState("임원");
+        const [searchQuery, setSearchQuery] = useState("");
+        const [isDragging, setIsDragging] = useState(false);
+        const [selectedPerson, setSelectedPerson] = useState(null);
+        const [activeTab, setActiveTab] = useState(0);
+        
+        const [popupPerson, setPopupPerson] = useState(null);
+        const [printMode, setPrintMode] = useState(null);
+
+        const currentList = useMemo(() => {
+            if (!db) return [];
+            
+            if (searchQuery) {
+                const matchedNames = new Set();
+                const globalList = [];
+                
+                db.availableYears.forEach(year => {
+                    if (db.sheetsData[year]) {
+                        db.sheetsData[year].forEach(row => {
+                            const name = String(row['이름'] || '');
+                            if (name.includes(searchQuery) && !matchedNames.has(name)) {
+                                matchedNames.add(name);
+                                globalList.push(row);
+                            }
+                        });
+                    }
+                });
+                return globalList.sort((a, b) => String(a['이름'] || '').localeCompare(String(b['이름'] || '')));
+            } else {
+                if (!db.sheetsData[currentYear]) return [];
+                let list = db.sheetsData[currentYear].filter(row => row['그룹'] === currentGroup);
+                return list.sort((a, b) => String(a['이름'] || '').localeCompare(String(b['이름'] || '')));
+            }
+        }, [db, currentYear, currentGroup, searchQuery]);
+
+        useEffect(() => {
+            const handleKeyDown = (e) => {
+                if (activeTab !== 0 || !selectedPerson || !db || printMode) return;
+                if (document.activeElement.tagName === 'INPUT') return;
+                if (currentList.length === 0) return;
+                const idx = currentList.findIndex(p => p['이름'] === selectedPerson);
+                if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedPerson(currentList[idx < currentList.length - 1 ? idx + 1 : 0]['이름']); }
+                else if (e.key === 'ArrowUp') { e.preventDefault(); setSelectedPerson(currentList[idx > 0 ? idx - 1 : currentList.length - 1]['이름']); }
+            };
+            window.addEventListener('keydown', handleKeyDown);
+            return () => window.removeEventListener('keydown', handleKeyDown);
+        }, [selectedPerson, currentList, activeTab, db, printMode]);
+
+        useEffect(() => {
+            if (printMode) {
+                const timer = setTimeout(() => {
+                    window.print();
+                }, 500);
+                return () => clearTimeout(timer);
+            }
+        }, [printMode]);
+
+        useEffect(() => {
+            const handleAfterPrint = () => setPrintMode(null);
+            window.addEventListener('afterprint', handleAfterPrint);
+            return () => window.removeEventListener('afterprint', handleAfterPrint);
+        }, []);
+
+        const handleFileUpload = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const workbook = XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
+                    const parsedDb = parseExcelData(workbook);
+                    setDb(parsedDb);
+                    const firstGroup = parsedDb.availableGroups[0] || '임원';
+                    setCurrentGroup(firstGroup);
+                    if (parsedDb.availableYears.includes("2025")) setCurrentYear("2025");
+                    else if (parsedDb.availableYears.length > 0) setCurrentYear(parsedDb.availableYears[0]);
+                } catch (err) {
+                    alert("엑셀 파일 파싱 중 오류가 발생했습니다.\n\n" + err.message);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        };
+
+        // [Logic 개선 적용] 전년 순위 표시 형태 및 그룹 변경 감지 강화
+        const rankingData = useMemo(() => {
+            if (!db || !db.sheetsData[currentYear]) return [];
+            const list = db.sheetsData[currentYear].filter(row => row['그룹'] === currentGroup);
+            let ranks = list.map(row => ({
+                이름: row['이름'],
+                합산: parseFloat(row['종합점수']) || 0,
+                Rank: parseInt(row['종합순위']) || 999,
+                동료_Rank: parseInt(row['동료순위']) || null,
+                부하_Rank: parseInt(row['부하순위']) || null,
+                상사_Rank: parseInt(row['상사순위']) || null,
+            })).sort((a, b) => a.Rank - b.Rank);
+
+            const yearIndex = db.availableYears.indexOf(currentYear);
+            const prevYear = yearIndex !== -1 && yearIndex + 1 < db.availableYears.length ? db.availableYears[yearIndex + 1] : null;
+            
+            if (prevYear && db.sheetsData[prevYear]) {
+                const prevMap = {};
+                db.sheetsData[prevYear].forEach(r => { 
+                    prevMap[r['이름']] = {
+                        rank: parseInt(r['종합순위']),
+                        group: r['그룹']
+                    }; 
+                });
+
+                ranks = ranks.map(r => {
+                    const prevData = prevMap[r.이름];
+                    if (!prevData) return { ...r, prevText: '-', prevColor: 'text-slate-400' };
+
+                    const pRank = prevData.rank;
+
+                    // 그룹이 변경된 경우 (예: 팀장 -> 임원)
+                    if (prevData.group !== currentGroup) {
+                        const pRankStr = pRank ? ` (${pRank}위)` : '';
+                        return { 
+                            ...r, 
+                            prevText: `전년 ${prevData.group}${pRankStr}`, 
+                            prevColor: 'text-[14px] text-orange-600 font-bold tracking-tight'
+                        };
+                    }
+
+                    if (!pRank) return { ...r, prevText: '-', prevColor: 'text-slate-400' };
+                    const diff = pRank - r.Rank;
+                    // 가독성을 위한 띄어쓰기 추가: ▲ 10 (15위)
+                    return { 
+                        ...r, 
+                        prevText: diff > 0 ? `▲ ${diff} (${pRank}위)` : diff < 0 ? `▼ ${Math.abs(diff)} (${pRank}위)` : `— (${pRank}위)`, 
+                        prevColor: diff > 0 ? 'text-blue-600' : diff < 0 ? 'text-red-600' : 'text-slate-500' 
+                    };
+                });
+            }
+            return ranks;
+        }, [db, currentYear, currentGroup]);
+
+        const reportDataList = useMemo(() => {
+            if (!selectedPerson || !db) return [];
+            try {
+                if (searchQuery) {
+                    const history = [];
+                    db.availableYears.forEach(year => {
+                        if (db.sheetsData[year]) {
+                            const row = db.sheetsData[year].find(r => r['이름'] === selectedPerson);
+                            if (row) {
+                                const groupCount = db.sheetsData[year].filter(r => r['그룹'] === row['그룹']).length;
+                                history.push({ 
+                                    year, 
+                                    data: calculatePersonScore(row),
+                                    rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount }
+                                });
+                            }
+                        }
+                    });
+                    return history;
+                } else {
+                    if (!db.sheetsData[currentYear]) return [];
+                    const row = db.sheetsData[currentYear].find(r => r['그룹'] === currentGroup && r['이름'] === selectedPerson);
+                    if (row) {
+                        const groupCount = db.sheetsData[currentYear].filter(r => r['그룹'] === row['그룹']).length;
+                        return [{ 
+                            year: currentYear, 
+                            data: calculatePersonScore(row), 
+                            rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount } 
+                        }];
+                    }
+                    return [];
+                }
+            } catch (e) { console.error(e); return []; }
+        }, [selectedPerson, db, currentYear, currentGroup, searchQuery]);
+
+        const popupDataList = useMemo(() => {
+            if (!popupPerson || !db) return [];
+            try {
+                const history = [];
+                db.availableYears.forEach(year => {
+                    if (db.sheetsData[year]) {
+                        const row = db.sheetsData[year].find(r => r['이름'] === popupPerson);
+                        if (row) {
+                            const groupCount = db.sheetsData[year].filter(r => r['그룹'] === row['그룹']).length;
+                            history.push({ 
+                                year, 
+                                data: calculatePersonScore(row),
+                                rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount }
+                            });
+                        }
+                    }
+                });
+                return history;
+            } catch (e) { console.error(e); return []; }
+        }, [popupPerson, db]);
+
+        const batchPrintDataList = useMemo(() => {
+            if (printMode !== 'batch' || !db || !db.sheetsData[currentYear]) return [];
+            const list = db.sheetsData[currentYear].filter(row => row['그룹'] === currentGroup);
+            const total = list.length;
+            return list.sort((a, b) => String(a['이름'] || '').localeCompare(String(b['이름'] || '')))
+                       .map(row => ({ 
+                           year: currentYear, 
+                           personName: row['이름'], 
+                           data: calculatePersonScore(row),
+                           rankInfo: { rank: parseInt(row['종합순위']) || '-', total: total }
+                       }));
+        }, [printMode, db, currentYear, currentGroup]);
+
+        if (!db) {
+            const handleDrop = (e) => {
+                e.preventDefault(); setIsDragging(false);
+                const file = e.dataTransfer.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    try {
+                        const workbook = XLSX.read(new Uint8Array(evt.target.result), { type: 'array' });
+                        const parsedDb = parseExcelData(workbook);
+                        setDb(parsedDb);
+                        const firstGroup = parsedDb.availableGroups[0] || '임원';
+                        setCurrentGroup(firstGroup);
+                        if (parsedDb.availableYears.includes("2025")) setCurrentYear("2025");
+                        else if (parsedDb.availableYears.length > 0) setCurrentYear(parsedDb.availableYears[0]);
+                    } catch (err) { alert("엑셀 파일 파싱 중 오류가 발생했습니다.\n\n" + err.message); }
+                };
+                reader.readAsArrayBuffer(file);
+            };
+            return (
+                <div className="flex w-full h-full items-center justify-center bg-gradient-to-br from-slate-100 to-blue-50">
+                    <div className="p-12 bg-white rounded-3xl shadow-2xl text-center border border-slate-200 max-w-md w-full mx-4">
+                        <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg">
+                            <svg className="w-9 h-9 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                        </div>
+                        <h1 className="text-2xl font-black text-blue-900 mb-2 tracking-tight">다면평가 Report 뷰어</h1>
+                        <p className="text-sm text-slate-400 font-medium mb-8">마스터 데이터 파일을 불러오면 바로 시작됩니다</p>
+                        <label
+                            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                            onDragLeave={() => setIsDragging(false)}
+                            onDrop={handleDrop}
+                            className={`flex flex-col items-center px-10 py-12 rounded-2xl cursor-pointer transition-all border-2 border-dashed shadow-inner ${isDragging ? 'bg-blue-50 border-blue-500 scale-[1.02]' : 'bg-slate-50 border-slate-300 hover:bg-blue-50 hover:border-blue-400'}`}>
+                            <svg className={`w-12 h-12 mb-4 transition-colors ${isDragging ? 'text-blue-500' : 'text-slate-400'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                            <span className={`text-[17px] font-bold transition-colors ${isDragging ? 'text-blue-700' : 'text-slate-700'}`}>{isDragging ? '파일을 놓으세요!' : '파일 선택 또는 여기로 드롭'}</span>
+                            <span className="text-sm text-slate-400 mt-2 font-medium">.xlsx / .xls 형식 지원</span>
+                            <input type="file" accept=".xlsx, .xls" className="hidden" onChange={handleFileUpload} />
+                        </label>
+                    </div>
+                </div>
+            );
+        }
+
+        return (
+            <React.Fragment>
+                {/* [인쇄 전용 View] */}
+                {printMode && (
+                    <div className="print-expand max-w-5xl mx-auto p-0 m-0 bg-white">
+                        {printMode === 'single' || printMode === 'single_evaluatee' ? (
+                            (popupPerson ? popupDataList : reportDataList).map((report, idx) => (
+                                <ReportCard 
+                                    key={idx} 
+                                    year={report.year} 
+                                    personName={popupPerson || selectedPerson} 
+                                    data={report.data} 
+                                    rankInfo={report.rankInfo} 
+                                    isEvaluateeMode={printMode === 'single_evaluatee'} 
+                                />
+                            ))
+                        ) : (
+                            batchPrintDataList.map((report, idx) => (
+                                <ReportCard key={idx} year={report.year} personName={report.personName} data={report.data} rankInfo={report.rankInfo} />
+                            ))
+                        )}
+                    </div>
+                )}
+
+                {/* 개인별 리포트 팝업창 (Modal) */}
+                {popupPerson && (
+                    <div className="fixed inset-0 z-[99990] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 md:p-8 no-print">
+                        <div className="bg-slate-100 w-full max-w-5xl h-full rounded-[2rem] shadow-2xl flex flex-col overflow-hidden relative animate-[fadeIn_0.2s_ease-out]">
+                            {/* 팝업 헤더 */}
+                            <div className="flex justify-between items-center px-8 py-5 border-b border-slate-200 bg-white shadow-sm z-10 shrink-0">
+                                <h2 className="text-2xl font-black text-blue-900">
+                                    <span className="text-blue-600 mr-2">{popupPerson}</span>개인별 상세 리포트
+                                </h2>
+                                <div className="flex items-center space-x-3">
+                                    <button onClick={() => setPrintMode('single_evaluatee')} className="flex items-center bg-white text-emerald-600 border border-emerald-200 hover:bg-emerald-50 hover:border-emerald-300 font-bold py-2 px-4 rounded-xl transition-all shadow-sm text-sm outline-none">
+                                        <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+                                        피평가자용 PDF
+                                    </button>
+                                    <button onClick={() => setPrintMode('single')} className="flex items-center bg-white text-red-600 border border-red-200 hover:bg-red-50 hover:border-red-300 font-bold py-2 px-4 rounded-xl transition-all shadow-sm text-sm outline-none">
+                                        <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"></path></svg>
+                                        CEO용 PDF
+                                    </button>
+                                    <button onClick={() => setPopupPerson(null)} className="text-slate-400 hover:text-slate-600 bg-slate-100 hover:bg-slate-200 p-2 rounded-xl transition-all outline-none ml-2">
+                                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="flex-1 overflow-y-auto p-8 scrollable">
+                                <div className="max-w-5xl mx-auto">
+                                    {popupDataList.length === 0 ? (
+                                        <p className="text-center text-slate-500 font-bold mt-10">조회 가능한 데이터가 없습니다.</p>
+                                    ) : (
+                                        popupDataList.map((report, idx) => (
+                                            <ReportCard key={`popup-${idx}`} year={report.year} personName={popupPerson} data={report.data} rankInfo={report.rankInfo} />
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* 메인 UI */}
+                <div className={`flex w-full h-full bg-slate-100 font-sans ${printMode ? 'no-print hidden' : ''}`}>
+                    {/* 사이드바 */}
+                    <div className="w-[330px] bg-white border-r border-slate-200 flex flex-col shadow-2xl z-10 shrink-0 no-print">
+                        <div className="p-7 border-b border-slate-100 pb-6">
+                            <h2 className="text-[22px] font-black text-blue-900 flex items-center mb-6 tracking-tight">
+                                <svg className="w-6 h-6 mr-2.5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                                개인별 Report
+                            </h2>
+                            <select className="w-full p-3.5 mb-5 bg-slate-50 border border-slate-200 rounded-xl text-[15px] font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer shadow-sm"
+                                value={currentYear} onChange={e => { setCurrentYear(e.target.value); setSelectedPerson(null); }}>
+                                {db.availableYears.map(y => <option key={y} value={y}>{y}년 평가 데이터</option>)}
+                            </select>
+                            <div className="flex p-1.5 mb-5 bg-slate-100 rounded-xl shadow-inner">
+                                {(db.availableGroups && db.availableGroups.length > 0 ? db.availableGroups : ['임원', '팀장']).map(grp => (
+                                    <button key={grp} onClick={() => { setCurrentGroup(grp); setSelectedPerson(null); }}
+                                        className={`flex-1 py-2.5 text-[15px] font-black rounded-lg transition-all outline-none ${currentGroup === grp ? 'bg-white shadow text-blue-700' : 'text-slate-500 hover:text-slate-800'}`}>
+                                        {grp}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="relative">
+                                <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                                    <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                                </div>
+                                <input type="text" placeholder="이름 검색 (히스토리 조회)"
+                                    className="w-full pl-11 pr-10 p-3.5 text-[15px] font-bold border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none bg-slate-50 focus:bg-white placeholder-slate-400 shadow-sm transition-colors"
+                                    value={searchQuery} 
+                                    onChange={e => { setSearchQuery(e.target.value); setSelectedPerson(null); }}
+                                    onKeyDown={e => {
+                                        if (e.key === 'Enter' && currentList.length > 0) {
+                                            setSelectedPerson(currentList[0]['이름']);
+                                            setActiveTab(0);
+                                        }
+                                    }} 
+                                />
+                                {searchQuery && (
+                                    <button 
+                                        onClick={() => { setSearchQuery(""); setSelectedPerson(null); }}
+                                        className="absolute inset-y-0 right-0 pr-3.5 flex items-center text-slate-400 hover:text-slate-700 outline-none"
+                                        title="검색어 지우기"
+                                    >
+                                        <svg className="w-5 h-5 bg-slate-200 rounded-full p-0.5 text-white hover:bg-slate-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-4 scrollable">
+                            <div className="flex justify-between items-center px-2 mb-3 mt-1">
+                                <p className="text-xs font-black text-slate-400">평가 대상자 명단</p>
+                                <span className="bg-slate-100 text-slate-500 text-[10px] px-2 py-0.5 rounded-full font-bold">{currentList.length}명</span>
+                            </div>
+                            {currentList.length === 0 ? (
+                                <p className="text-sm text-red-500 px-3 font-bold">데이터가 없습니다.</p>
+                            ) : currentList.map(row => {
+                                const isSel = selectedPerson === row['이름'];
+                                return (
+                                    <button key={row['이름']} onClick={() => { setSelectedPerson(row['이름']); setActiveTab(0); }}
+                                        className={`w-full text-left px-5 py-3.5 mb-2 rounded-xl text-[16px] transition-all border outline-none ${isSel ? 'bg-gradient-to-r from-blue-50 to-blue-100/50 text-blue-900 font-black border-blue-200 shadow-sm' : 'text-slate-600 font-medium hover:bg-slate-50 border-transparent hover:border-slate-200'}`}>
+                                        {row['이름']}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                        <div className="p-6 border-t border-slate-100 bg-slate-50/50 space-y-3">
+                            <button onClick={() => {
+                                const printList = db.sheetsData[currentYear]?.filter(row => row['그룹'] === currentGroup) || [];
+                                if (printList.length === 0) { alert("출력할 대상자가 없습니다."); return; }
+                                setPrintMode('batch');
+                            }}
+                                className="w-full flex items-center justify-center bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-xl transition-all shadow-md outline-none">
+                                <svg className="w-5 h-5 mr-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                                {currentGroup} 일괄 고화질 출력 (PDF)
+                            </button>
+                            <label className="w-full flex items-center justify-center bg-white hover:bg-blue-50 text-blue-600 border border-blue-200 hover:border-blue-400 font-bold py-3 rounded-xl transition-all shadow-sm outline-none cursor-pointer">
+                                <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                                다른 파일로 교체
+                                <input type="file" accept=".xlsx, .xls" className="hidden" onChange={(e) => { handleFileUpload(e); setSelectedPerson(null); setSearchQuery(""); setActiveTab(0); }} />
+                            </label>
+                        </div>
+                    </div>
+
+                    {/* 메인 콘텐츠 영역 */}
+                    <div className="flex-1 flex flex-col h-full overflow-hidden bg-[#f8fafc]">
+                        <div className="bg-white border-b border-slate-200 px-10 pt-6 flex space-x-10 shrink-0 shadow-sm no-print">
+                            <button onClick={() => setActiveTab(0)} className={`pb-4 font-black text-[16px] border-b-[3px] transition-colors outline-none ${activeTab === 0 ? 'border-blue-600 text-blue-800' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>
+                                👤 개인별 상세 리포트
+                            </button>
+                            <button onClick={() => setActiveTab(1)} className={`pb-4 font-black text-[16px] border-b-[3px] transition-colors outline-none ${activeTab === 1 ? 'border-blue-600 text-blue-800' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>
+                                🏆 그룹 전체 순위 (Ranking)
+                            </button>
+                        </div>
+
+                        <div className="flex-1 overflow-y-auto p-10 scrollable">
+                            {activeTab === 0 && (
+                                !selectedPerson ? (
+                                    <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-5 pb-20">
+                                        <svg className="w-24 h-24 text-slate-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                                        <p className="text-xl font-bold text-slate-500">좌측 명단에서 대상자를 선택하세요</p>
+                                        <div className="bg-white px-8 py-5 rounded-2xl shadow-sm border border-slate-200 text-center space-y-1.5">
+                                            <p className="text-[15px] font-medium text-slate-600"><span className="bg-slate-100 text-slate-800 px-2 py-0.5 rounded font-bold mr-1">↑ / ↓</span> 키보드 방향키로 빠르게 탐색</p>
+                                            <p className="text-sm font-medium text-slate-500"><span className="text-blue-600 font-bold">Enter</span> 키를 누르면 바로 리포트 조회 가능</p>
+                                        </div>
+                                    </div>
+                                ) : reportDataList.length === 0 ? <p className="text-red-500 font-bold">데이터가 없습니다.</p> : (
+                                    <div className="max-w-5xl mx-auto">
+                                        <div className="flex justify-end mb-4 no-print space-x-3">
+                                            <button onClick={() => setPrintMode('single_evaluatee')}
+                                                className="flex items-center bg-white text-emerald-600 border border-emerald-200 hover:bg-emerald-50 hover:border-emerald-300 font-black py-2.5 px-5 rounded-xl transition-all shadow-sm text-[15px] outline-none">
+                                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+                                                피평가자용 PDF (익명화)
+                                            </button>
+                                            <button onClick={() => setPrintMode('single')}
+                                                className="flex items-center bg-white text-red-600 border border-red-200 hover:bg-red-50 hover:border-red-300 font-black py-2.5 px-5 rounded-xl transition-all shadow-sm text-[15px] outline-none">
+                                                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
+                                                CEO용 PDF 출력
+                                            </button>
+                                        </div>
+                                        {reportDataList.map((report, idx) => (
+                                            <ReportCard key={idx} year={report.year} personName={selectedPerson} data={report.data} rankInfo={report.rankInfo} />
+                                        ))}
+                                    </div>
+                                )
+                            )}
+
+                            {activeTab === 1 && (
+                                <div className="max-w-[1200px] mx-auto bg-white shadow-lg rounded-[2rem] border border-slate-200 overflow-hidden">
+                                    <div className="p-8 border-b border-slate-200 bg-gradient-to-b from-slate-50 to-white">
+                                        <h2 className="text-[26px] font-black text-slate-800">{currentGroup} 전체 순위 <span className="text-blue-600">({currentYear})</span></h2>
+                                        <p className="text-sm font-bold text-slate-500 mt-2">💡 대상자 이름을 클릭하시면 팝업으로 상세 리포트를 바로 확인할 수 있습니다.</p>
+                                    </div>
+                                    <div className="p-8">
+                                        <div className="rounded-2xl border border-slate-200 overflow-hidden">
+                                            <table className="w-full text-[15px] text-center">
+                                                <thead className="bg-slate-100 text-slate-700 border-b-2 border-slate-300">
+                                                    <tr>
+                                                        {/* 컬럼명 명확히 수정 */}
+                                                        {['Rank', '이름', '종합 점수', '동료 (Rank)', '부하 (Rank)', '상사 (Rank)', '전년 대비(전년 순위)'].map((h, i) => (
+                                                            <th key={i} className="py-4 px-3 font-black border-r border-slate-200 last:border-r-0" style={{ verticalAlign: 'middle' }}>{h}</th>
+                                                        ))}
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {rankingData.length === 0 ? (
+                                                        <tr><td colSpan="7" className="py-12 text-red-500 font-bold">데이터가 없습니다.</td></tr>
+                                                    ) : rankingData.map((row, i) => {
+                                                        const topN = currentGroup === '임원' ? 3 : 5;
+                                                        const total = rankingData.length;
+                                                        const rankCell = (val) => {
+                                                            if (!val) return <td className="py-4 px-3 border-r border-slate-200 text-slate-300" style={{ verticalAlign: 'middle' }}>-</td>;
+                                                            const isTop = val <= topN && val <= total / 2;
+                                                            const isBot = val > total - topN && val > total / 2;
+                                                            return (
+                                                                <td className="py-4 px-3 border-r border-slate-200" style={{ verticalAlign: 'middle' }}>
+                                                                    <span className={`${isTop ? 'bg-blue-50 text-blue-700 border border-blue-100 px-3 py-1.5 rounded-lg inline-block min-w-[40px] font-black' : isBot ? 'bg-red-50 text-red-700 border border-red-100 px-3 py-1.5 rounded-lg inline-block min-w-[40px] font-black' : 'text-slate-700 font-bold'}`}>{val}</span>
+                                                                </td>
+                                                            );
+                                                        };
+                                                        return (
+                                                            <tr key={i} className="hover:bg-blue-50/30 transition-colors bg-white border-t border-slate-100">
+                                                                <td className="py-4 px-3 border-r border-slate-200 font-black text-slate-800 bg-slate-50/50" style={{ verticalAlign: 'middle' }}>{row.Rank}</td>
+                                                                
+                                                                <td className="py-4 px-3 border-r border-slate-200 font-black text-slate-800" style={{ verticalAlign: 'middle' }}>
+                                                                    <button 
+                                                                        onClick={() => setPopupPerson(row.이름)} 
+                                                                        className="hover:text-blue-600 hover:underline underline-offset-4 decoration-2 decoration-blue-300 transition-all outline-none"
+                                                                        title={`${row.이름} 리포트 팝업 보기`}
+                                                                    >
+                                                                        {row.이름}
+                                                                    </button>
+                                                                </td>
+
+                                                                <td className="py-4 px-3 border-r border-slate-200 font-black text-blue-700 text-[17px]" style={{ verticalAlign: 'middle' }}>{row.합산.toFixed(2)}</td>
+                                                                {rankCell(row.동료_Rank)}
+                                                                {rankCell(row.부하_Rank)}
+                                                                {rankCell(row.상사_Rank)}
+                                                                <td className={`py-4 px-3 font-black text-[16px] ${row.prevColor || 'text-slate-400'}`} style={{ verticalAlign: 'middle' }}>
+                                                                    {row.prevText || '-'}
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </React.Fragment>
+        );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+</script>
+</body>
+</html>
