@@ -283,6 +283,167 @@
     };
 
     // =====================================================================
+    // [Component] 연도별 순위 추이 요약
+    // =====================================================================
+    const TrendSummary = ({ dataList, personName }) => {
+        // 2개 연도 이상 데이터가 있을 때만 표시
+        const sorted = useMemo(() => {
+            return [...dataList].sort((a, b) => parseInt(a.year) - parseInt(b.year));
+        }, [dataList]);
+
+        if (sorted.length < 2) return null;
+
+        const categories = [
+            { key: '동료', label: '동료 순위 추이', color: '#16a34a', bgLight: '#f0fdf4', border: '#bbf7d0' },
+            { key: '부하', label: '부하 순위 추이', color: '#ea580c', bgLight: '#fff7ed', border: '#fed7aa' },
+            { key: '상사', label: '상사 순위 추이', color: '#dc2626', bgLight: '#fff1f2', border: '#fecdd3' }
+        ];
+
+        // 각 카테고리별 데이터가 최소 2개 연도 이상 있는지 체크
+        const validCategories = categories.filter(cat => {
+            const validYears = sorted.filter(d => d.subRanks && d.subRanks[cat.key] && d.subRanks[cat.key].rank !== null);
+            return validYears.length >= 2;
+        });
+
+        if (validCategories.length === 0) return null;
+
+        const MiniRankChart = ({ cat }) => {
+            const points = sorted
+                .map(d => ({
+                    year: d.year,
+                    rank: d.subRanks?.[cat.key]?.rank || null,
+                    total: d.subRanks?.[cat.key]?.total || null
+                }))
+                .filter(p => p.rank !== null);
+
+            if (points.length < 2) return null;
+
+            const maxRank = Math.max(...points.map(p => p.total || p.rank), ...points.map(p => p.rank));
+            const chartW = 240;
+            const chartH = 140;
+            const padL = 30;
+            const padR = 15;
+            const padT = 15;
+            const padB = 40;
+            const innerW = chartW - padL - padR;
+            const innerH = chartH - padT - padB;
+            const barW = Math.min(36, innerW / points.length * 0.6);
+            const gap = innerW / points.length;
+
+            const yScale = (rank) => padT + ((rank - 1) / Math.max(maxRank - 1, 1)) * innerH;
+            const xScale = (i) => padL + gap * i + gap / 2;
+
+            // y축 눈금 (1, 중간, 최대)
+            const yTicks = maxRank <= 3 ? Array.from({ length: maxRank }, (_, i) => i + 1) :
+                [1, Math.ceil(maxRank / 2), maxRank];
+
+            return (
+                <div className="flex flex-col items-center">
+                    <div className="flex items-center mb-2">
+                        <span className="w-2.5 h-2.5 rounded-full mr-2 shrink-0" style={{ backgroundColor: cat.color }}></span>
+                        <span className="text-[13px] font-black text-slate-700">{cat.label}</span>
+                    </div>
+                    <svg width={chartW} height={chartH} style={{ overflow: 'visible' }}>
+                        {/* 배경 그리드 */}
+                        {yTicks.map(t => (
+                            <g key={`grid-${t}`}>
+                                <line x1={padL} y1={yScale(t)} x2={chartW - padR} y2={yScale(t)} stroke="#e2e8f0" strokeWidth="1" strokeDasharray="3 3" />
+                                <text x={padL - 6} y={yScale(t)} textAnchor="end" dominantBaseline="middle" fontSize="10" fill="#94a3b8" fontWeight="700"
+                                      style={{ fontFamily: "'Malgun Gothic', sans-serif" }}>{t}</text>
+                            </g>
+                        ))}
+                        {/* 막대 */}
+                        {points.map((p, i) => {
+                            const x = xScale(i);
+                            const y = yScale(p.rank);
+                            const barTop = y;
+                            const barBottom = padT + innerH;
+                            return (
+                                <g key={`bar-${i}`}>
+                                    <rect x={x - barW / 2} y={barTop} width={barW} height={Math.max(barBottom - barTop, 2)}
+                                          rx="4" fill={cat.color} fillOpacity="0.18" stroke={cat.color} strokeWidth="1.5" strokeOpacity="0.4" />
+                                    {/* 순위 텍스트 (막대 위) */}
+                                    <text x={x} y={barTop - 5} textAnchor="middle" fontSize="11" fontWeight="900" fill={cat.color}
+                                          style={{ fontFamily: "'Malgun Gothic', sans-serif" }}>
+                                        {p.rank}위
+                                    </text>
+                                    {/* 모수 텍스트 (막대 안 상단) */}
+                                    {p.total && (
+                                        <text x={x} y={barTop + 16} textAnchor="middle" fontSize="9" fontWeight="700" fill={cat.color} fillOpacity="0.7"
+                                              style={{ fontFamily: "'Malgun Gothic', sans-serif" }}>
+                                            ({p.total}명)
+                                        </text>
+                                    )}
+                                    {/* 연도 라벨 */}
+                                    <text x={x} y={chartH - padB + 16} textAnchor="middle" fontSize="11" fontWeight="800" fill="#475569"
+                                          style={{ fontFamily: "'Malgun Gothic', sans-serif" }}>
+                                        {p.year}
+                                    </text>
+                                </g>
+                            );
+                        })}
+                        {/* 꺾은선 */}
+                        {points.length >= 2 && (
+                            <polyline
+                                fill="none" stroke={cat.color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round"
+                                points={points.map((p, i) => `${xScale(i)},${yScale(p.rank)}`).join(' ')}
+                            />
+                        )}
+                        {/* 꺾은선 포인트 */}
+                        {points.map((p, i) => (
+                            <circle key={`dot-${i}`} cx={xScale(i)} cy={yScale(p.rank)} r="4" fill="white" stroke={cat.color} strokeWidth="2.5" />
+                        ))}
+                    </svg>
+                </div>
+            );
+        };
+
+        return (
+            <div className="pdf-section-block bg-white border border-slate-200 rounded-3xl p-8 mb-8 shadow-sm print:shadow-none print:border-slate-300 print:p-6 print:mb-6">
+                <h3 className="text-[18px] font-black text-slate-800 mb-5 flex items-center print:text-[16px] print:mb-4">
+                    <span className="mr-2.5">📈</span>
+                    <span>{nbsp(`${personName} 연도별 순위 추이`)}</span>
+                </h3>
+
+                {/* 전체 종합 순위 - 뱃지형 텍스트 */}
+                <div className="mb-6 print:mb-5">
+                    <p className="text-[13px] font-bold text-slate-500 mb-3">종합 순위</p>
+                    <div className="flex flex-wrap gap-3">
+                        {sorted.map((d, i) => {
+                            const rank = d.rankInfo?.rank;
+                            const total = d.rankInfo?.total;
+                            const isLatest = i === sorted.length - 1;
+                            return (
+                                <div key={d.year} className={`flex items-center rounded-xl px-4 py-2.5 border ${isLatest ? 'bg-blue-50 border-blue-200' : 'bg-slate-50 border-slate-200'}`}>
+                                    <span className={`text-[13px] font-bold mr-2.5 ${isLatest ? 'text-blue-600' : 'text-slate-500'}`}>{d.year}</span>
+                                    <span className={`text-[18px] font-black ${isLatest ? 'text-blue-700' : 'text-slate-700'}`}>
+                                        {rank !== '-' && rank ? `${rank}위` : '-'}
+                                    </span>
+                                    {total && total !== '-' && (
+                                        <span className={`text-[12px] font-bold ml-1.5 ${isLatest ? 'text-blue-400' : 'text-slate-400'}`}>({total}명)</span>
+                                    )}
+                                    {d.group && (
+                                        <span className={`text-[11px] font-bold ml-2 px-2 py-0.5 rounded-full ${isLatest ? 'bg-blue-100 text-blue-500' : 'bg-slate-100 text-slate-400'}`}>{d.group}</span>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+
+                {/* 동료/부하/상사 순위 추이 차트 */}
+                <div className={`flex flex-wrap justify-center gap-4 ${validCategories.length <= 2 ? 'justify-center' : ''}`}>
+                    {validCategories.map(cat => (
+                        <div key={cat.key} className="rounded-2xl border px-5 py-4 print:px-4 print:py-3" style={{ backgroundColor: cat.bgLight, borderColor: cat.border }}>
+                            <MiniRankChart cat={cat} />
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+    };
+
+    // =====================================================================
     // [Component] 리포트 카드
     // =====================================================================
     const ReportCard = ({ year, personName, data, rankInfo, isEvaluateeMode = false }) => {
@@ -634,6 +795,17 @@
             return ranks;
         }, [db, currentYear, currentGroup]);
 
+        const getSubRanks = (db, year, row) => {
+            const group = row['그룹'];
+            const groupRows = db.sheetsData[year].filter(r => r['그룹'] === group);
+            const countValid = (key) => groupRows.filter(r => r[key] !== undefined && r[key] !== '' && !isNaN(parseInt(r[key]))).length;
+            return {
+                동료: { rank: parseInt(row['동료순위']) || null, total: countValid('동료순위') },
+                부하: { rank: parseInt(row['부하순위']) || null, total: countValid('부하순위') },
+                상사: { rank: parseInt(row['상사순위']) || null, total: countValid('상사순위') }
+            };
+        };
+
         const reportDataList = useMemo(() => {
             if (!selectedPerson || !db) return [];
             try {
@@ -647,7 +819,9 @@
                                 history.push({ 
                                     year, 
                                     data: calculatePersonScore(row),
-                                    rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount }
+                                    rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount },
+                                    subRanks: getSubRanks(db, year, row),
+                                    group: row['그룹']
                                 });
                             }
                         }
@@ -661,7 +835,9 @@
                         return [{ 
                             year: currentYear, 
                             data: calculatePersonScore(row), 
-                            rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount } 
+                            rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount },
+                            subRanks: getSubRanks(db, currentYear, row),
+                            group: row['그룹']
                         }];
                     }
                     return [];
@@ -681,7 +857,9 @@
                             history.push({ 
                                 year, 
                                 data: calculatePersonScore(row),
-                                rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount }
+                                rankInfo: { rank: parseInt(row['종합순위']) || '-', total: groupCount },
+                                subRanks: getSubRanks(db, year, row),
+                                group: row['그룹']
                             });
                         }
                     }
@@ -797,9 +975,12 @@
                                     {popupDataList.length === 0 ? (
                                         <p className="text-center text-slate-500 font-bold mt-10">조회 가능한 데이터가 없습니다.</p>
                                     ) : (
-                                        popupDataList.map((report, idx) => (
-                                            <ReportCard key={`popup-${idx}`} year={report.year} personName={popupPerson} data={report.data} rankInfo={report.rankInfo} />
-                                        ))
+                                        <React.Fragment>
+                                            <TrendSummary dataList={popupDataList} personName={popupPerson} />
+                                            {popupDataList.map((report, idx) => (
+                                                <ReportCard key={`popup-${idx}`} year={report.year} personName={popupPerson} data={report.data} rankInfo={report.rankInfo} />
+                                            ))}
+                                        </React.Fragment>
                                     )}
                                 </div>
                             </div>
@@ -925,6 +1106,7 @@
                                                 CEO용 PDF 출력
                                             </button>
                                         </div>
+                                        <TrendSummary dataList={reportDataList} personName={selectedPerson} />
                                         {reportDataList.map((report, idx) => (
                                             <ReportCard key={idx} year={report.year} personName={selectedPerson} data={report.data} rankInfo={report.rankInfo} />
                                         ))}
